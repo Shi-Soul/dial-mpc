@@ -1,0 +1,32 @@
+{
+  "g1_wbc_joint_global": {
+    "contact_mismatch": 4.0,
+    "contact_switch": 2.0,
+    "ee_global_pos_error": 3.0,
+    "ee_local_pos_error": 2.0,
+    "root_pos_error": 1.5,
+    "root_rot_error": 0.5,
+    "joint_pos_error": 0.25,
+    "control_delta": 0.05
+  },
+  "g1_wbc_joint": {
+    "contact_mismatch": 4.0,
+    "contact_switch": 2.0,
+    "ee_global_pos_error": 3.0,
+    "ee_local_pos_error": 2.0,
+    "root_pos_error": 1.5,
+    "root_rot_error": 0.5,
+    "joint_pos_error": 0.25,
+    "control_delta": 0.05
+  },
+  "g1_wbc_ee": {
+    "contact_mismatch": 4.0,
+    "contact_switch": 2.0,
+    "ee_global_pos_error": 3.0,
+    "ee_local_pos_error": 2.0,
+    "root_pos_error": 1.5,
+    "root_rot_error": 0.5,
+    "joint_pos_error": 0.25,
+    "control_delta": 0.05
+  }
+}
