@@ -22,6 +22,10 @@ from dial_mpc.g1_wbc_jax.metrics import compute_rollout_scores, score_from_terms
 from dial_mpc.g1_wbc_jax.model import build_wbc_mj_model, joint_limits
 from dial_mpc.g1_wbc_jax.motion import load_motion
 from dial_mpc.g1_wbc_jax.mpc import G1WbcDialMpcConfig, initial_plan, make_optimize_window_with_context
+from dial_mpc.g1_wbc_jax.objective_config import (
+    DEFAULT_OBJECTIVE_WEIGHTS_JSON,
+    MPC_OBJECTIVE_METHOD_CHOICES,
+)
 from dial_mpc.g1_wbc_jax.obs import init_obs_state
 from dial_mpc.g1_wbc_jax.planner import RolloutScoreContext, make_wbc_mjx_rollout_score_fn
 from dial_mpc.g1_wbc_jax.policy import load_torch_actor
@@ -31,6 +35,12 @@ from dial_mpc.g1_wbc_jax.rollout import (
     extract_robot_state,
     make_mjx_open_loop_rollout,
     make_mjx_policy_rollout,
+)
+from dial_mpc.g1_wbc_jax.sim_config import (
+    SIM_PRESET_CHOICES,
+    apply_sim_preset,
+    sim_decimation as sim_decimation_for_preset,
+    simulation_payload,
 )
 from dial_mpc.g1_wbc_jax.math import qvel_from_qpos_trajectory
 
@@ -53,6 +63,8 @@ def main() -> None:
 
 def profile(args: argparse.Namespace) -> dict[str, object]:
     model = build_wbc_mj_model(args.model_path)
+    apply_sim_preset(model, args.sim_preset)
+    sim_decimation = sim_decimation_for_preset(args.sim_preset)
     actor = load_torch_actor(args.checkpoint)
     motion = load_motion(args.motion, motion_type=args.motion_type)
     reward_weights = _load_reward_weights(args.reward_weights_json, args.method)
@@ -73,18 +85,30 @@ def profile(args: argparse.Namespace) -> dict[str, object]:
         min_joint_sigma=args.mpc_min_joint_sigma,
         command_reg_weight=args.mpc_command_reg_weight,
         command_smooth_weight=args.mpc_command_smooth_weight,
+        score_batch_size=args.mpc_score_batch_size,
     )
-    rollout_config = G1WbcRolloutConfig(max_steps=mpc_config.planning_horizon_steps)
-    rollout_fn = make_mjx_policy_rollout(model, actor, motion, rollout_config)
+    rollout_config = G1WbcRolloutConfig(
+        max_steps=mpc_config.planning_horizon_steps,
+        decimation=sim_decimation,
+    )
     open_loop_fn = make_mjx_open_loop_rollout(model, rollout_config)
-    score_fn = make_wbc_mjx_rollout_score_fn(
-        model,
-        actor,
-        motion,
-        rollout_config,
-        mode=args.method,
-        reward_weights=reward_weights,
-    )
+    rollout_fn = make_mjx_policy_rollout(model, actor, motion, rollout_config)
+    if args.bypass_policy:
+        score_fn = _make_bypass_policy_score_fn(
+            open_loop_fn,
+            motion,
+            mode=args.method,
+            reward_weights=reward_weights,
+        )
+    else:
+        score_fn = make_wbc_mjx_rollout_score_fn(
+            model,
+            actor,
+            motion,
+            rollout_config,
+            mode=args.method,
+            reward_weights=reward_weights,
+        )
     optimize = make_optimize_window_with_context(mpc_config, score_fn, init=False)
 
     horizon = mpc_config.planning_horizon_steps
@@ -110,7 +134,10 @@ def profile(args: argparse.Namespace) -> dict[str, object]:
 
     @jax.jit
     def rollout_only(qpos):
-        trace = rollout_fn(qpos, initial_qpos, initial_qvel, last_action, obs_state, ref_start).trace
+        if args.bypass_policy:
+            trace = open_loop_fn(qpos[..., 7:], initial_qpos, initial_qvel)
+        else:
+            trace = rollout_fn(qpos, initial_qpos, initial_qvel, last_action, obs_state, ref_start).trace
         return _score_trace_checksum(trace)
 
     @jax.jit
@@ -132,7 +159,10 @@ def profile(args: argparse.Namespace) -> dict[str, object]:
         rng_out, result = optimize(rng_in, base_qpos, nodes, joint_low, joint_high, context)
         return rng_out, result.best_score, jnp.sum(result.scores), jnp.sum(result.plan_nodes)
 
-    trace_sample = rollout_fn(candidate_qpos, initial_qpos, initial_qvel, last_action, obs_state, ref_start).trace
+    if args.bypass_policy:
+        trace_sample = open_loop_fn(candidate_qpos[..., 7:], initial_qpos, initial_qvel)
+    else:
+        trace_sample = rollout_fn(candidate_qpos, initial_qpos, initial_qvel, last_action, obs_state, ref_start).trace
     trace_sample.qpos.block_until_ready()
 
     timings = {
@@ -199,17 +229,12 @@ def profile(args: argparse.Namespace) -> dict[str, object]:
             "control_steps": mpc_config.control_steps,
             "node_count": mpc_config.node_count,
             "n_diffuse": mpc_config.n_diffuse,
+            "score_batch_size": mpc_config.score_batch_size,
             "decimation": rollout_config.decimation,
             "physics_substeps_per_score": int(num_candidates * horizon * rollout_config.decimation),
+            "bypass_policy": bool(args.bypass_policy),
         },
-        "simulation": {
-            "timestep": float(model.opt.timestep),
-            "integrator": mujoco.mjtIntegrator(model.opt.integrator).name,
-            "solver": mujoco.mjtSolver(model.opt.solver).name,
-            "cone": mujoco.mjtCone(model.opt.cone).name,
-            "iterations": int(model.opt.iterations),
-            "ls_iterations": int(model.opt.ls_iterations),
-        },
+        "simulation": simulation_payload(model, rollout_config.decimation, args.sim_preset),
         "timings": timings,
         "derived": derived,
         "fractions_of_full_optimize": fractions,
@@ -239,6 +264,24 @@ def _make_command_kinematics(model: mujoco.MjModel):
         )
 
     return command_kinematics
+
+
+def _make_bypass_policy_score_fn(
+    open_loop_fn,
+    motion,
+    *,
+    mode: str,
+    reward_weights: dict[str, float] | None,
+):
+    def score_fn(candidate_qpos: jnp.ndarray, context: RolloutScoreContext) -> jnp.ndarray:
+        # Use candidate joint targets directly as controls.  This keeps the
+        # candidate/MPC graph live while removing obs construction and actor forward.
+        controls = candidate_qpos[..., 7:]
+        rollout = open_loop_fn(controls, context.initial_qpos, context.initial_qvel)
+        _, terms = compute_rollout_scores(motion, rollout)
+        return score_from_terms(terms, mode=mode, reward_weights=reward_weights)
+
+    return score_fn
 
 
 def _trace_checksum(trace) -> jnp.ndarray:
@@ -307,9 +350,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--motion", required=True)
     parser.add_argument("--motion-type", default="auto", choices=("auto", "mujoco", "isaaclab"))
     parser.add_argument("--checkpoint", default="bc")
-    parser.add_argument("--method", default="g1_wbc_joint")
+    parser.add_argument("--method", default="g1_wbc_joint_global", choices=MPC_OBJECTIVE_METHOD_CHOICES)
     parser.add_argument("--model-path", default=None)
-    parser.add_argument("--reward-weights-json", default=None)
+    parser.add_argument("--sim-preset", default="default", choices=SIM_PRESET_CHOICES)
+    parser.add_argument("--reward-weights-json", default=str(DEFAULT_OBJECTIVE_WEIGHTS_JSON))
+    parser.add_argument("--bypass-policy", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mpc-samples", type=int, default=16)
     parser.add_argument("--mpc-horizon", type=int, default=20)
@@ -326,6 +371,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-min-joint-sigma", type=float, default=0.008)
     parser.add_argument("--mpc-command-reg-weight", type=float, default=0.02)
     parser.add_argument("--mpc-command-smooth-weight", type=float, default=0.00005)
+    parser.add_argument("--mpc-score-batch-size", type=int, default=0)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=8)
     parser.add_argument("--output-json", default=None)
