@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys as py_sys
 import time
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import mujoco
 import numpy as np
 
 from dial_mpc.g1_wbc_jax.artifacts import save_command_npz, save_rollout_npz
@@ -21,7 +21,12 @@ from dial_mpc.g1_wbc_jax.mpc import (
     G1WbcDialMpcConfig,
     initial_plan,
     make_optimize_window_with_context,
+    make_optimize_window_with_context_host_chunked,
     shift_plan,
+)
+from dial_mpc.g1_wbc_jax.objective_config import (
+    DEFAULT_OBJECTIVE_WEIGHTS_JSON,
+    EVALUATE_METHOD_CHOICES,
 )
 from dial_mpc.g1_wbc_jax.obs import init_obs_state
 from dial_mpc.g1_wbc_jax.planner import (
@@ -37,6 +42,12 @@ from dial_mpc.g1_wbc_jax.rollout import (
     make_policy_rollout,
     mjx_command_batch_from_qpos_trajectory,
 )
+from dial_mpc.g1_wbc_jax.sim_config import (
+    SIM_PRESET_CHOICES,
+    apply_sim_preset,
+    sim_decimation,
+    simulation_payload,
+)
 
 
 def main() -> None:
@@ -44,8 +55,8 @@ def main() -> None:
     motion = _load_reference_motion(args)
     total_steps = _resolve_steps(motion, args.max_steps)
     mj_model = build_wbc_mj_model(args.model_path)
-    _apply_sim_preset(mj_model, args.sim_preset)
-    sim_decimation = _sim_decimation(args.sim_preset)
+    apply_sim_preset(mj_model, args.sim_preset)
+    sim_decimation_value = sim_decimation(args.sim_preset)
     sys = build_wbc_system(args.model_path) if args.backend == "brax" else None
     if args.sim_preset != "default" and args.backend != "mjx":
         raise ValueError("--sim-preset currently only applies to the MJX backend.")
@@ -54,11 +65,11 @@ def main() -> None:
 
     if args.method == "no_mpc":
         trace, command_qpos, candidate_scores, mpc_payload = _run_no_mpc(
-            args, sys, mj_model, actor, motion, total_steps, sim_decimation
+            args, sys, mj_model, actor, motion, total_steps, sim_decimation_value
         )
     else:
         trace, command_qpos, candidate_scores, mpc_payload = _run_dial_mpc(
-            args, sys, mj_model, actor, motion, total_steps, sim_decimation
+            args, sys, mj_model, actor, motion, total_steps, sim_decimation_value
         )
 
     metrics = compute_rollout_metrics(motion, trace)
@@ -75,7 +86,7 @@ def main() -> None:
         "max_steps": total_steps,
         "ref_offset": args.ref_offset,
         "metrics": metrics,
-        "simulation": _simulation_payload(mj_model, sim_decimation, args.sim_preset),
+        "simulation": simulation_payload(mj_model, sim_decimation_value, args.sim_preset),
     }
     if mpc_payload is not None:
         payload["mpc"] = mpc_payload
@@ -131,6 +142,7 @@ def _run_dial_mpc(args, sys, mj_model, actor, motion: G1Motion, total_steps: int
         min_joint_sigma=args.mpc_min_joint_sigma,
         command_reg_weight=args.mpc_command_reg_weight,
         command_smooth_weight=args.mpc_command_smooth_weight,
+        score_batch_size=args.mpc_score_batch_size,
     )
     if mpc_config.planning_horizon_steps <= mpc_config.control_steps:
         raise ValueError("planning horizon must be larger than control steps for receding-horizon execution.")
@@ -159,8 +171,13 @@ def _run_dial_mpc(args, sys, mj_model, actor, motion: G1Motion, total_steps: int
             mode=args.method,
             reward_weights=reward_weights,
         )
-    optimize_init = make_optimize_window_with_context(mpc_config, score_fn, init=True)
-    optimize = make_optimize_window_with_context(mpc_config, score_fn, init=False)
+    optimizer_factory = (
+        make_optimize_window_with_context_host_chunked
+        if args.mpc_host_chunked
+        else make_optimize_window_with_context
+    )
+    optimize_init = optimizer_factory(mpc_config, score_fn, init=True)
+    optimize = optimizer_factory(mpc_config, score_fn, init=False)
     execute_fn = (
         make_mjx_policy_rollout(
             mj_model,
@@ -215,6 +232,14 @@ def _run_dial_mpc(args, sys, mj_model, actor, motion: G1Motion, total_steps: int
         rng, result = opt_fn(rng, base_qpos, plan_nodes, joint_low, joint_high, ctx)
         result.best_qpos.block_until_ready()
         solve_time = time.perf_counter() - t0
+        print(
+            "MPC_PROGRESS "
+            f"start={int(start)} total_steps={int(total_steps)} "
+            f"execute_steps={int(execute_steps)} solve_time_s={solve_time:.6f} "
+            f"best_score={float(result.best_score):.6f} mean_score={float(result.mean_score):.6f}",
+            file=py_sys.stderr,
+            flush=True,
+        )
         last_scores = result.scores
         exec_out = execute_fn(
             result.best_qpos,
@@ -258,6 +283,8 @@ def _run_dial_mpc(args, sys, mj_model, actor, motion: G1Motion, total_steps: int
         "node_count": mpc_config.node_count,
         "n_diffuse": mpc_config.n_diffuse,
         "n_diffuse_init": mpc_config.n_diffuse_init,
+        "score_batch_size": mpc_config.score_batch_size,
+        "host_chunked": bool(args.mpc_host_chunked),
         "sim_decimation": sim_decimation,
         "temperature": mpc_config.temp_sample,
         "reward_weight_source": (
@@ -330,49 +357,6 @@ def _load_reward_weights(path: str | None, method: str) -> dict[str, float] | No
     return {str(key): float(value) for key, value in raw.items()}
 
 
-def _apply_sim_preset(model: mujoco.MjModel, preset: str) -> None:
-    if preset == "default":
-        return
-    if preset != "go2":
-        raise ValueError(f"Unsupported simulation preset: {preset}")
-    model.opt.timestep = 0.02
-    model.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
-    model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
-    model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-    model.opt.iterations = 2
-    model.opt.ls_iterations = 5
-    if hasattr(model.opt, "ccd_iterations"):
-        model.opt.ccd_iterations = 35
-    model.opt.tolerance = 1.0e-8
-    model.opt.ls_tolerance = 1.0e-2
-    model.opt.impratio = 1.0
-    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
-
-
-def _sim_decimation(preset: str) -> int:
-    return 1 if preset == "go2" else 4
-
-
-def _simulation_payload(model: mujoco.MjModel, decimation: int, preset: str) -> dict[str, object]:
-    return {
-        "preset": preset,
-        "timestep": float(model.opt.timestep),
-        "policy_dt": float(model.opt.timestep * decimation),
-        "decimation": int(decimation),
-        "integrator": mujoco.mjtIntegrator(model.opt.integrator).name,
-        "solver": mujoco.mjtSolver(model.opt.solver).name,
-        "cone": mujoco.mjtCone(model.opt.cone).name,
-        "iterations": int(model.opt.iterations),
-        "ls_iterations": int(model.opt.ls_iterations),
-        "ccd_iterations": int(model.opt.ccd_iterations) if hasattr(model.opt, "ccd_iterations") else None,
-        "tolerance": float(model.opt.tolerance),
-        "ls_tolerance": float(model.opt.ls_tolerance),
-        "impratio": float(model.opt.impratio),
-        "disableflags": int(model.opt.disableflags),
-        "enableflags": int(model.opt.enableflags),
-    }
-
-
 def _window_qpos(qpos: jnp.ndarray, start: int, horizon: int) -> jnp.ndarray:
     idx = jnp.clip(jnp.arange(start, start + horizon), 0, qpos.shape[0] - 1)
     return qpos[idx]
@@ -433,17 +417,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         default="g1_wbc_joint_global",
-        choices=("no_mpc", "g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"),
+        choices=EVALUATE_METHOD_CHOICES,
     )
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--backend", default="mjx", choices=("mjx", "brax"))
-    parser.add_argument("--sim-preset", default="default", choices=("default", "go2"))
+    parser.add_argument("--sim-preset", default="default", choices=SIM_PRESET_CHOICES)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--ref-offset", type=int, default=0)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--save-rollout", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--reward-weights-json", default=None)
+    parser.add_argument("--reward-weights-json", default=str(DEFAULT_OBJECTIVE_WEIGHTS_JSON))
     parser.add_argument("--mpc-samples", type=int, default=64)
     parser.add_argument("--mpc-horizon", type=int, default=30)
     parser.add_argument("--mpc-control-steps", type=int, default=10)
@@ -461,6 +445,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-min-joint-sigma", type=float, default=0.008)
     parser.add_argument("--mpc-command-reg-weight", type=float, default=0.0)
     parser.add_argument("--mpc-command-smooth-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--mpc-score-batch-size",
+        type=int,
+        default=0,
+        help="Score candidate trajectories in fixed-size chunks; 0 scores the full sample batch at once.",
+    )
+    parser.add_argument(
+        "--mpc-host-chunked",
+        action="store_true",
+        help="Use host-loop DIAL-MPC updates with JIT-compiled score chunks for large correctness runs.",
+    )
     return parser.parse_args()
 
 

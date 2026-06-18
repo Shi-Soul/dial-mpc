@@ -45,6 +45,7 @@ class G1WbcDialMpcConfig:
     command_reg_weight: float = 0.0
     command_smooth_weight: float = 0.0
     freeze_first_frame: bool = True
+    score_batch_size: int = 0
 
 
 class WindowResult(NamedTuple):
@@ -103,7 +104,7 @@ def make_optimize_window(config: G1WbcDialMpcConfig, score_fn: ScoreFn, *, init:
             candidates = jnp.concatenate([candidates, mean_nodes[None, :, :]], axis=0)
             delta = expand_delta_to_horizon(jnp.swapaxes(candidates, 0, 1), config.planning_horizon_steps)
             qpos = apply_delta_to_qpos(base_qpos, delta, joint_low=joint_low, joint_high=joint_high)
-            scores = score_fn(qpos) - command_regularization(
+            scores = _score_candidates(config, score_fn, qpos) - command_regularization(
                 delta,
                 config.command_reg_weight,
                 config.command_smooth_weight,
@@ -185,7 +186,7 @@ def make_optimize_window_with_context(
             candidates = jnp.concatenate([candidates, mean_nodes[None, :, :]], axis=0)
             delta = expand_delta_to_horizon(jnp.swapaxes(candidates, 0, 1), config.planning_horizon_steps)
             qpos = apply_delta_to_qpos(base_qpos, delta, joint_low=joint_low, joint_high=joint_high)
-            scores = score_fn(qpos, score_context) - command_regularization(
+            scores = _score_candidates_with_context(config, score_fn, qpos, score_context) - command_regularization(
                 delta,
                 config.command_reg_weight,
                 config.command_smooth_weight,
@@ -234,6 +235,130 @@ def make_optimize_window_with_context(
     return optimize_window
 
 
+def make_optimize_window_with_context_host_chunked(
+    config: G1WbcDialMpcConfig,
+    score_fn: ContextScoreFn,
+    *,
+    init: bool = False,
+):
+    """Host-loop optimizer for large correctness runs.
+
+    This keeps DIAL-MPC's sampling distribution, receding-horizon warm start, and
+    weighted-mean update, but avoids compiling one monolithic graph that contains
+    every candidate rollout for high-sample correctness benchmarks.
+    """
+
+    n_diffuse = config.n_diffuse_init if init else config.n_diffuse
+    noise_schedule = _noise_schedule(config, n_diffuse)
+    score_batch_size = int(config.score_batch_size)
+
+    @jax.jit
+    def sample_candidates(rng: jnp.ndarray, mean_nodes: jnp.ndarray, noise_scale: jnp.ndarray):
+        rng, sample_rng = jax.random.split(rng)
+        eps = jax.random.normal(
+            sample_rng,
+            (config.num_samples, config.node_count, COMMAND_DELTA_DIM),
+            dtype=mean_nodes.dtype,
+        )
+        candidates = mean_nodes[None, :, :] + eps * noise_scale[None, :, :]
+        candidates = candidates.at[:, 0, :].set(0.0) if config.freeze_first_frame else candidates
+        candidates = jnp.concatenate([candidates, mean_nodes[None, :, :]], axis=0)
+        return rng, candidates
+
+    @jax.jit
+    def candidates_to_delta_qpos(
+        candidates: jnp.ndarray,
+        base_qpos: jnp.ndarray,
+        joint_low: jnp.ndarray,
+        joint_high: jnp.ndarray,
+    ):
+        delta = expand_delta_to_horizon(jnp.swapaxes(candidates, 0, 1), config.planning_horizon_steps)
+        qpos = apply_delta_to_qpos(base_qpos, delta, joint_low=joint_low, joint_high=joint_high)
+        regularization = command_regularization(
+            delta,
+            config.command_reg_weight,
+            config.command_smooth_weight,
+        )
+        return delta, qpos, regularization
+
+    @jax.jit
+    def score_batch(qpos_chunk: jnp.ndarray, score_context):
+        return score_fn(qpos_chunk, score_context)
+
+    @jax.jit
+    def update_mean(candidates: jnp.ndarray, scores: jnp.ndarray):
+        baseline = scores[-1]
+        normalized = (scores - baseline) / (jnp.std(scores) + 1.0e-6)
+        weights = jax.nn.softmax(normalized / max(float(config.temp_sample), 1.0e-6))
+        mean_nodes = jnp.einsum("n,nkd->kd", weights, candidates)
+        mean_nodes = mean_nodes.at[0].set(0.0) if config.freeze_first_frame else mean_nodes
+        return mean_nodes
+
+    def optimize_window(
+        rng: jnp.ndarray,
+        base_qpos: jnp.ndarray,
+        plan_nodes: jnp.ndarray,
+        joint_low: jnp.ndarray,
+        joint_high: jnp.ndarray,
+        score_context,
+    ) -> tuple[jnp.ndarray, WindowResult]:
+        best_score = jnp.asarray(-jnp.inf, dtype=base_qpos.dtype)
+        best_qpos = jnp.asarray(base_qpos)
+        best_delta = jnp.zeros((config.planning_horizon_steps, COMMAND_DELTA_DIM), dtype=base_qpos.dtype)
+        final_scores = None
+        mean_nodes = plan_nodes
+
+        for noise_scale in list(noise_schedule):
+            rng, candidates = sample_candidates(rng, mean_nodes, noise_scale)
+            delta, qpos, regularization = candidates_to_delta_qpos(candidates, base_qpos, joint_low, joint_high)
+            scores = _score_qpos_chunks_host(qpos, score_context, score_batch, score_batch_size) - regularization
+            scores.block_until_ready()
+            candidate_best_idx = int(jnp.argmax(scores).item())
+            candidate_best_score = scores[candidate_best_idx]
+            if float(candidate_best_score) > float(best_score):
+                best_score = candidate_best_score
+                best_qpos = qpos[:, candidate_best_idx]
+                best_delta = delta[:, candidate_best_idx]
+            mean_nodes = update_mean(candidates, scores)
+            mean_nodes.block_until_ready()
+            final_scores = scores
+
+        if final_scores is None:
+            raise ValueError("DIAL-MPC host optimizer requires at least one diffuse step.")
+        return rng, WindowResult(
+            plan_nodes=mean_nodes,
+            best_qpos=best_qpos,
+            best_delta=best_delta,
+            scores=final_scores,
+            best_score=best_score,
+            mean_score=jnp.mean(final_scores),
+        )
+
+    return optimize_window
+
+
+def _score_qpos_chunks_host(
+    qpos: jnp.ndarray,
+    score_context,
+    score_batch,
+    score_batch_size: int,
+) -> jnp.ndarray:
+    candidate_count = int(qpos.shape[1])
+    if score_batch_size <= 0 or score_batch_size >= candidate_count:
+        return score_batch(qpos, score_context)
+    chunks = []
+    for start in range(0, candidate_count, score_batch_size):
+        end = min(start + score_batch_size, candidate_count)
+        qpos_chunk = qpos[:, start:end]
+        count = end - start
+        if count < score_batch_size:
+            pad = jnp.broadcast_to(qpos_chunk[:, -1:, :], (qpos.shape[0], score_batch_size - count, qpos.shape[2]))
+            qpos_chunk = jnp.concatenate([qpos_chunk, pad], axis=1)
+        scores = score_batch(qpos_chunk, score_context)
+        chunks.append(scores[:count])
+    return jnp.concatenate(chunks, axis=0)
+
+
 def expand_delta_to_horizon(delta_nodes: jnp.ndarray, horizon: int) -> jnp.ndarray:
     """Expand ``(K, N, 35)`` command delta nodes to ``(H, N, 35)``."""
 
@@ -270,6 +395,43 @@ def command_regularization(delta: jnp.ndarray, reg_weight: float, smooth_weight:
     else:
         smooth = jnp.zeros(delta.shape[1], dtype=delta.dtype)
     return float(reg_weight) * reg + float(smooth_weight) * smooth
+
+
+def _score_candidates(config: G1WbcDialMpcConfig, score_fn: ScoreFn, qpos: jnp.ndarray) -> jnp.ndarray:
+    batch_size = int(config.score_batch_size)
+    if batch_size <= 0 or batch_size >= qpos.shape[1]:
+        return score_fn(qpos)
+    return _chunked_score(qpos, batch_size, score_fn)
+
+
+def _score_candidates_with_context(
+    config: G1WbcDialMpcConfig,
+    score_fn: ContextScoreFn,
+    qpos: jnp.ndarray,
+    context,
+) -> jnp.ndarray:
+    batch_size = int(config.score_batch_size)
+    if batch_size <= 0 or batch_size >= qpos.shape[1]:
+        return score_fn(qpos, context)
+    return _chunked_score(qpos, batch_size, lambda chunk: score_fn(chunk, context))
+
+
+def _chunked_score(qpos: jnp.ndarray, batch_size: int, score_chunk_fn: ScoreFn) -> jnp.ndarray:
+    candidate_count = int(qpos.shape[1])
+    pad_count = (-candidate_count) % batch_size
+    if pad_count:
+        padding = jnp.broadcast_to(qpos[:, -1:, :], (qpos.shape[0], pad_count, qpos.shape[2]))
+        qpos = jnp.concatenate([qpos, padding], axis=1)
+    padded_count = int(qpos.shape[1])
+    chunk_count = padded_count // batch_size
+    qpos_chunks = qpos.reshape((qpos.shape[0], chunk_count, batch_size, qpos.shape[2]))
+    qpos_chunks = jnp.swapaxes(qpos_chunks, 0, 1)
+
+    def score_one(chunk):
+        return score_chunk_fn(chunk)
+
+    scores = jax.lax.map(score_one, qpos_chunks)
+    return scores.reshape((padded_count,))[:candidate_count]
 
 
 def _noise_schedule(config: G1WbcDialMpcConfig, n_diffuse: int) -> jnp.ndarray:
